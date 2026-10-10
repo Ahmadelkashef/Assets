@@ -1,0 +1,95 @@
+name: Update Reels Manifests
+
+on:
+  push:
+    branches:
+      - main
+    paths:
+      - 'Videos/Reels/**'
+      - '.github/workflows/main.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  update-manifests:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Generate category manifests
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import json
+          from pathlib import Path
+
+          reels_dir = Path("Videos/Reels")
+
+          categories = [
+              "Highlights",
+              "Challenges",
+              "Competitions"
+          ]
+
+          video_extensions = {
+              ".mp4",
+              ".webm",
+              ".mov",
+              ".m4v",
+              ".avi"
+          }
+
+          for category in categories:
+              category_dir = reels_dir / category
+              manifest_path = category_dir / "manifest.json"
+
+              category_dir.mkdir(parents=True, exist_ok=True)
+
+              videos = sorted(
+                  [
+                      file.name
+                      for file in category_dir.iterdir()
+                      if file.is_file()
+                      and file.suffix.lower() in video_extensions
+                  ],
+                  key=str.lower
+              )
+
+              manifest_path.write_text(
+                  json.dumps(
+                      videos,
+                      ensure_ascii=False,
+                      indent=2
+                  ) + "\n",
+                  encoding="utf-8"
+              )
+
+              print(
+                  f"{category}: "
+                  f"Found {len(videos)} video(s)."
+              )
+              print(f"Manifest: {manifest_path}")
+
+          PY
+
+      - name: Commit manifests if changed
+        shell: bash
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+          git add \
+            Videos/Reels/Highlights/manifest.json \
+            Videos/Reels/Challenges/manifest.json \
+            Videos/Reels/Competitions/manifest.json
+
+          if git diff --cached --quiet; then
+            echo "No manifest changes."
+          else
+            git commit -m "chore: update reels category manifests"
+            git push
+          fi
