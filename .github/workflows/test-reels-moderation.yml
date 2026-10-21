@@ -1,5 +1,5 @@
 
-name: Test iPLAY Reels Moderation
+name: Test iPLAY Reels AI
 
 on:
   workflow_dispatch:
@@ -8,9 +8,9 @@ permissions:
   contents: read
 
 jobs:
-  test-moderation:
+  analyze-reels:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 60
 
     steps:
       - name: Checkout Assets
@@ -21,148 +21,507 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y ffmpeg
           python -m pip install --upgrade pip
-          pip install torch transformers pillow pandas
+          pip install torch transformers pillow
 
       - name: Analyze Reels
         shell: bash
         run: |
-          cat > test_moderation.py <<'PY'
+          cat > test_reels_ai.py <<'PY'
           import csv
           import json
           import subprocess
           import tempfile
           from pathlib import Path
+          from collections import defaultdict
+
           from transformers import pipeline
 
-          root = Path("Videos/Reels")
-          categories = ["Highlights", "Challenges", "Competitions"]
+          ROOT = Path("Videos/Reels")
 
-          print("Loading open-source image moderation model...")
-          model = pipeline(
-              "image-classification",
-              model="Falconsai/nsfw_image_detection",
-              device=-1
-          )
+          CATEGORIES = [
+              "Highlights",
+              "Challenges",
+              "Competitions"
+          ]
 
-          output = Path("moderation_results.csv")
-          rows = []
+          MODERATION_MODEL = "Falconsai/nsfw_image_detection"
+          SPORTS_MODEL = "openai/clip-vit-base-patch32"
 
-          for category in categories:
-              folder = root / category
-              manifest = folder / "manifest.json"
+          NSFW_THRESHOLD = 0.50
+          REVIEW_THRESHOLD = 0.85
 
-              if not manifest.exists():
-                  print(f"Skipping {category}: manifest missing")
-                  continue
+          # Labels used by the sports image classifier.
+          SPORTS_LABELS = {
+              "Football (Soccer)": (
+                  "a frame from a football soccer match "
+                  "with players and a soccer ball on a pitch"
+              ),
+              "Basketball": (
+                  "a frame from a basketball game "
+                  "with players and a basketball hoop"
+              ),
+              "Volleyball": (
+                  "a frame from a volleyball game "
+                  "with players and a volleyball net"
+              ),
+              "Swimming": (
+                  "a frame showing people swimming "
+                  "in a swimming pool"
+              ),
+              "Padel": (
+                  "a frame from a padel match "
+                  "with players, padel rackets and glass court walls"
+              ),
+              "Tennis": (
+                  "a frame from a tennis match "
+                  "with tennis rackets and a tennis court"
+              ),
+              "Table Tennis": (
+                  "a frame from a table tennis match "
+                  "with a small table, paddles and a ping pong ball"
+              ),
+              "Other Sport": (
+                  "a frame showing a sport or athletic activity "
+                  "not listed in the other categories"
+              ),
+              "Non-sports / Lifestyle": (
+                  "a non-sports scene such as home decor, "
+                  "wedding decorations, a bathroom or lifestyle content"
+              )
+          }
 
-              videos = json.loads(
-                  manifest.read_text(encoding="utf-8")
+          FRAME_REPORT = Path("reels_ai_frame_results.csv")
+          VIDEO_REPORT = Path("reels_ai_video_summary.csv")
+
+          def log(message):
+              print(message, flush=True)
+
+          def get_video_duration(video):
+              result = subprocess.run(
+                  [
+                      "ffprobe",
+                      "-v", "error",
+                      "-show_entries", "format=duration",
+                      "-of", "default=noprint_wrappers=1:nokey=1",
+                      str(video)
+                  ],
+                  capture_output=True,
+                  text=True
               )
 
-              for filename in videos:
-                  video = folder / filename
+              if result.returncode != 0:
+                  return None
 
-                  if not video.is_file():
-                      print(f"Missing video: {video}")
-                      continue
+              try:
+                  duration = float(result.stdout.strip())
+                  return duration if duration > 0 else None
+              except (ValueError, TypeError):
+                  return None
 
-                  print(f"Analyzing: {category}/{filename}")
+          def extract_frame(video, timestamp, frame_path):
+              result = subprocess.run(
+                  [
+                      "ffmpeg",
+                      "-y",
+                      "-loglevel", "error",
+                      "-ss", str(max(0, timestamp)),
+                      "-i", str(video),
+                      "-frames:v", "1",
+                      "-q:v", "3",
+                      str(frame_path)
+                  ],
+                  capture_output=True
+              )
 
-                  probe = subprocess.run(
-                      [
-                          "ffprobe", "-v", "error",
-                          "-show_entries", "format=duration",
-                          "-of", "default=noprint_wrappers=1:nokey=1",
-                          str(video)
-                      ],
-                      capture_output=True,
-                      text=True
+              return (
+                  result.returncode == 0
+                  and frame_path.exists()
+                  and frame_path.stat().st_size > 0
+              )
+
+          def load_manifest(category):
+              manifest = ROOT / category / "manifest.json"
+
+              if not manifest.exists():
+                  log(f"WARNING: Missing manifest: {manifest}")
+                  return []
+
+              try:
+                  videos = json.loads(
+                      manifest.read_text(encoding="utf-8")
                   )
 
-                  try:
-                      duration = float(probe.stdout.strip())
-                  except (ValueError, TypeError):
-                      print(f"Could not read duration: {filename}")
-                      continue
+                  if not isinstance(videos, list):
+                      log(f"WARNING: Invalid manifest: {manifest}")
+                      return []
 
-                  if duration <= 0:
-                      continue
+                  return videos
 
-                  timestamps = sorted(set([
-                      min(duration * 0.2, duration - 0.1),
-                      min(duration * 0.5, duration - 0.1),
-                      min(duration * 0.8, duration - 0.1)
-                  ]))
+              except Exception as error:
+                  log(f"WARNING: Cannot read {manifest}: {error}")
+                  return []
 
-                  with tempfile.TemporaryDirectory() as temp:
-                      for timestamp in timestamps:
-                          frame = Path(temp) / "frame.jpg"
+          def classify_moderation(predictions):
+              scores = {
+                  item["label"].strip().lower(): float(item["score"])
+                  for item in predictions
+              }
 
-                          result = subprocess.run(
-                              [
-                                  "ffmpeg", "-y", "-loglevel", "error",
-                                  "-ss", str(max(0, timestamp)),
-                                  "-i", str(video),
-                                  "-frames:v", "1",
-                                  "-q:v", "3", str(frame)
-                              ],
-                              capture_output=True
+              nsfw_score = next(
+                  (
+                      score
+                      for label, score in scores.items()
+                      if label == "nsfw"
+                      or "not safe for work" in label
+                  ),
+                  None
+              )
+
+              normal_score = next(
+                  (
+                      score
+                      for label, score in scores.items()
+                      if label == "normal"
+                      or label == "safe"
+              ),
+                  None
+              )
+
+              top = max(
+                  predictions,
+                  key=lambda item: item["score"]
+              )
+
+              if nsfw_score is None:
+                  status = "CHECK_MODEL_LABELS"
+              elif nsfw_score >= REVIEW_THRESHOLD:
+                  status = "REVIEW_HIGH"
+              elif nsfw_score >= NSFW_THRESHOLD:
+                  status = "REVIEW"
+              else:
+                  status = "NO_HIGH_FLAG"
+
+              return (
+                  nsfw_score,
+                  normal_score,
+                  top["label"],
+                  float(top["score"]),
+                  status
+              )
+
+          def classify_sport(classifier, frame_path):
+              predictions = classifier(
+                  str(frame_path),
+                  candidate_labels=list(SPORTS_LABELS.values())
+              )
+
+              prompt_to_label = {
+                  prompt: label
+                  for label, prompt in SPORTS_LABELS.items()
+              }
+
+              scores = {
+                  prompt_to_label[item["label"]]: float(item["score"])
+                  for item in predictions
+              }
+
+              top_label = max(scores, key=scores.get)
+
+              return top_label, scores[top_label], scores
+
+          def write_csv(path, rows, columns):
+              with path.open(
+                  "w",
+                  newline="",
+                  encoding="utf-8-sig"
+              ) as file:
+                  writer = csv.DictWriter(
+                      file,
+                      fieldnames=columns,
+                      extrasaction="ignore"
+                  )
+                  writer.writeheader()
+                  writer.writerows(rows)
+
+          def main():
+              log("Loading NSFW moderation model...")
+              moderation_model = pipeline(
+                  "image-classification",
+                  model=MODERATION_MODEL,
+                  device=-1
+              )
+
+              log("Loading sports classification model...")
+              sports_model = pipeline(
+                  "zero-shot-image-classification",
+                  model=SPORTS_MODEL,
+                  device=-1
+              )
+
+              frame_rows = []
+              video_rows = []
+
+              for category in CATEGORIES:
+                  videos = load_manifest(category)
+                  log(
+                      f"{category}: {len(videos)} video(s) "
+                      "listed in manifest"
+                  )
+
+                  for filename in videos:
+                      if not isinstance(filename, str):
+                          log(f"WARNING: Invalid filename: {filename}")
+                          continue
+
+                      video = ROOT / category / filename
+
+                      if not video.is_file():
+                          log(f"WARNING: Video not found: {video}")
+                          continue
+
+                      log(f"Analyzing: {category}/{filename}")
+
+                      duration = get_video_duration(video)
+
+                      if duration is None:
+                          log(f"WARNING: Cannot read duration: {filename}")
+                          continue
+
+                      timestamps = sorted(set([
+                          min(duration * 0.20, duration - 0.1),
+                          min(duration * 0.50, duration - 0.1),
+                          min(duration * 0.80, duration - 0.1)
+                      ]))
+
+                      video_frames = []
+                      sport_score_totals = defaultdict(float)
+                      moderation_scores = []
+                      moderation_statuses = []
+
+                      with tempfile.TemporaryDirectory() as temp:
+                          for frame_number, timestamp in enumerate(
+                              timestamps,
+                              start=1
+                          ):
+                              frame_path = (
+                                  Path(temp) / f"frame_{frame_number}.jpg"
+                              )
+
+                              if not extract_frame(
+                                  video,
+                                  timestamp,
+                                  frame_path
+                              ):
+                                  log(
+                                      f"WARNING: Frame extraction failed: "
+                                      f"{filename} at {timestamp:.2f}s"
+                                  )
+                                  continue
+
+                              try:
+                                  moderation_predictions = moderation_model(
+                                      str(frame_path),
+                                      top_k=None
+                                  )
+
+                                  (
+                                      nsfw_score,
+                                      normal_score,
+                                      moderation_top_label,
+                                      moderation_top_score,
+                                      moderation_status
+                                  ) = classify_moderation(
+                                      moderation_predictions
+                                  )
+
+                                  sport_label, sport_confidence, sport_scores = (
+                                      classify_sport(
+                                          sports_model,
+                                          frame_path
+                                      )
+                                  )
+
+                                  row = {
+                                      "category": category,
+                                      "video": filename,
+                                      "timestamp_seconds": round(
+                                          timestamp, 2
+                                      ),
+                                      "nsfw_score": (
+                                          round(nsfw_score, 4)
+                                          if nsfw_score is not None
+                                          else ""
+                                      ),
+                                      "normal_score": (
+                                          round(normal_score, 4)
+                                          if normal_score is not None
+                                          else ""
+                                      ),
+                                      "moderation_top_label": (
+                                          moderation_top_label
+                                      ),
+                                      "moderation_top_score": round(
+                                          moderation_top_score, 4
+                                      ),
+                                      "moderation_status": moderation_status,
+                                      "predicted_sport": sport_label,
+                                      "sport_confidence": round(
+                                          sport_confidence, 4
+                                      ),
+                                      "sport_scores_json": json.dumps(
+                                          sport_scores,
+                                          ensure_ascii=False
+                                      )
+                                  }
+
+                                  frame_rows.append(row)
+                                  video_frames.append(row)
+
+                                  for label, score in sport_scores.items():
+                                      sport_score_totals[label] += score
+
+                                  if nsfw_score is not None:
+                                      moderation_scores.append(nsfw_score)
+
+                                  moderation_statuses.append(
+                                      moderation_status
+                                  )
+
+                                  log(
+                                      f"  Frame {frame_number}: "
+                                      f"moderation={moderation_status}, "
+                                      f"NSFW={nsfw_score}, "
+                                      f"sport={sport_label} "
+                                      f"({sport_confidence:.3f})"
+                                  )
+
+                              except Exception as error:
+                                  log(
+                                      f"ERROR analyzing frame in "
+                                      f"{filename}: {error}"
+                                  )
+
+                      if not video_frames:
+                          log(f"WARNING: No frames analyzed: {filename}")
+                          continue
+
+                      frame_count = len(video_frames)
+
+                      average_sport_scores = {
+                          label: score / frame_count
+                          for label, score in sport_score_totals.items()
+                      }
+
+                      predicted_sport = max(
+                          average_sport_scores,
+                          key=average_sport_scores.get
+                      )
+
+                      average_nsfw = (
+                          sum(moderation_scores) / len(moderation_scores)
+                          if moderation_scores
+                          else None
+                      )
+
+                      if any(
+                          status == "CHECK_MODEL_LABELS"
+                          for status in moderation_statuses
+                      ):
+                          overall_moderation = "CHECK_MODEL_LABELS"
+                      elif any(
+                          status == "REVIEW_HIGH"
+                          for status in moderation_statuses
+                      ):
+                          overall_moderation = "REVIEW_HIGH"
+                      elif any(
+                          status == "REVIEW"
+                          for status in moderation_statuses
+                      ):
+                          overall_moderation = "REVIEW"
+                      else:
+                          overall_moderation = "NO_HIGH_FLAG"
+
+                      video_rows.append({
+                          "category": category,
+                          "video": filename,
+                          "duration_seconds": round(duration, 2),
+                          "frames_analyzed": frame_count,
+                          "average_nsfw_score": (
+                              round(average_nsfw, 4)
+                              if average_nsfw is not None
+                              else ""
+                          ),
+                          "moderation_status": overall_moderation,
+                          "predicted_sport": predicted_sport,
+                          "sport_confidence_average": round(
+                              average_sport_scores[predicted_sport], 4
+                          ),
+                          "sport_scores_json": json.dumps(
+                              average_sport_scores,
+                              ensure_ascii=False
                           )
+                      })
 
-                          if result.returncode != 0 or not frame.exists():
-                              continue
+                      log(
+                          f"Finished video: {filename}; "
+                          f"sport={predicted_sport}; "
+                          f"moderation={overall_moderation}"
+                      )
 
-                          try:
-                              predictions = model(str(frame))
-                              scores = {
-                                  item["label"].lower(): item["score"]
-                                  for item in predictions
-                              }
-
-                              porn = scores.get("porn", 0)
-                              hentai = scores.get("hentai", 0)
-                              sexy = scores.get("sexy", 0)
-
-                              if porn >= 0.5 or hentai >= 0.5:
-                                  status = "REVIEW_HIGH"
-                              elif sexy >= 0.5:
-                                  status = "REVIEW"
-                              else:
-                                  status = "NO_HIGH_FLAG"
-
-                              rows.append({
-                                  "category": category,
-                                  "video": filename,
-                                  "timestamp_seconds": round(timestamp, 2),
-                                  "porn_score": round(porn, 4),
-                                  "hentai_score": round(hentai, 4),
-                                  "sexy_score": round(sexy, 4),
-                                  "status": status
-                              })
-
-                          except Exception as error:
-                              print(f"Frame error: {error}")
-
-          with output.open("w", newline="", encoding="utf-8-sig") as file:
-              columns = [
-                  "category", "video", "timestamp_seconds",
-                  "porn_score", "hentai_score", "sexy_score", "status"
+              frame_columns = [
+                  "category",
+                  "video",
+                  "timestamp_seconds",
+                  "nsfw_score",
+                  "normal_score",
+                  "moderation_top_label",
+                  "moderation_top_score",
+                  "moderation_status",
+                  "predicted_sport",
+                  "sport_confidence",
+                  "sport_scores_json"
               ]
-              writer = csv.DictWriter(file, fieldnames=columns)
-              writer.writeheader()
-              writer.writerows(rows)
 
-          print(f"Finished. Analyzed {len(rows)} frames.")
-          print(f"Report: {output}")
+              video_columns = [
+                  "category",
+                  "video",
+                  "duration_seconds",
+                  "frames_analyzed",
+                  "average_nsfw_score",
+                  "moderation_status",
+                  "predicted_sport",
+                  "sport_confidence_average",
+                  "sport_scores_json"
+              ]
+
+              write_csv(FRAME_REPORT, frame_rows, frame_columns)
+              write_csv(VIDEO_REPORT, video_rows, video_columns)
+
+              log("")
+              log("========== ANALYSIS COMPLETE ==========")
+              log(f"Videos analyzed: {len(video_rows)}")
+              log(f"Frames analyzed: {len(frame_rows)}")
+              log(f"Frame report: {FRAME_REPORT}")
+              log(f"Video summary: {VIDEO_REPORT}")
+
+              if not video_rows:
+                  raise RuntimeError(
+                      "No videos were analyzed. Check manifests and logs."
+                  )
+
+          if __name__ == "__main__":
+              main()
           PY
 
-          python test_moderation.py
+          python test_reels_ai.py
 
-      - name: Upload moderation report
+      - name: Upload AI reports
         if: always()
         uses: actions/upload-artifact@v4
         with:
-          name: iplay-moderation-results
-          path: moderation_results.csv
+          name: iplay-reels-ai-reports
+          path: |
+            reels_ai_frame_results.csv
+            reels_ai_video_summary.csv
           if-no-files-found: warn
           retention-days: 7
