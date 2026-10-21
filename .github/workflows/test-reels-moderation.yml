@@ -1,0 +1,168 @@
+
+name: Test iPLAY Reels Moderation
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  test-moderation:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout Assets
+        uses: actions/checkout@v4
+
+      - name: Install dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y ffmpeg
+          python -m pip install --upgrade pip
+          pip install torch transformers pillow pandas
+
+      - name: Analyze Reels
+        shell: bash
+        run: |
+          cat > test_moderation.py <<'PY'
+          import csv
+          import json
+          import subprocess
+          import tempfile
+          from pathlib import Path
+          from transformers import pipeline
+
+          root = Path("Videos/Reels")
+          categories = ["Highlights", "Challenges", "Competitions"]
+
+          print("Loading open-source image moderation model...")
+          model = pipeline(
+              "image-classification",
+              model="Falconsai/nsfw_image_detection",
+              device=-1
+          )
+
+          output = Path("moderation_results.csv")
+          rows = []
+
+          for category in categories:
+              folder = root / category
+              manifest = folder / "manifest.json"
+
+              if not manifest.exists():
+                  print(f"Skipping {category}: manifest missing")
+                  continue
+
+              videos = json.loads(
+                  manifest.read_text(encoding="utf-8")
+              )
+
+              for filename in videos:
+                  video = folder / filename
+
+                  if not video.is_file():
+                      print(f"Missing video: {video}")
+                      continue
+
+                  print(f"Analyzing: {category}/{filename}")
+
+                  probe = subprocess.run(
+                      [
+                          "ffprobe", "-v", "error",
+                          "-show_entries", "format=duration",
+                          "-of", "default=noprint_wrappers=1:nokey=1",
+                          str(video)
+                      ],
+                      capture_output=True,
+                      text=True
+                  )
+
+                  try:
+                      duration = float(probe.stdout.strip())
+                  except (ValueError, TypeError):
+                      print(f"Could not read duration: {filename}")
+                      continue
+
+                  if duration <= 0:
+                      continue
+
+                  timestamps = sorted(set([
+                      min(duration * 0.2, duration - 0.1),
+                      min(duration * 0.5, duration - 0.1),
+                      min(duration * 0.8, duration - 0.1)
+                  ]))
+
+                  with tempfile.TemporaryDirectory() as temp:
+                      for timestamp in timestamps:
+                          frame = Path(temp) / "frame.jpg"
+
+                          result = subprocess.run(
+                              [
+                                  "ffmpeg", "-y", "-loglevel", "error",
+                                  "-ss", str(max(0, timestamp)),
+                                  "-i", str(video),
+                                  "-frames:v", "1",
+                                  "-q:v", "3", str(frame)
+                              ],
+                              capture_output=True
+                          )
+
+                          if result.returncode != 0 or not frame.exists():
+                              continue
+
+                          try:
+                              predictions = model(str(frame))
+                              scores = {
+                                  item["label"].lower(): item["score"]
+                                  for item in predictions
+                              }
+
+                              porn = scores.get("porn", 0)
+                              hentai = scores.get("hentai", 0)
+                              sexy = scores.get("sexy", 0)
+
+                              if porn >= 0.5 or hentai >= 0.5:
+                                  status = "REVIEW_HIGH"
+                              elif sexy >= 0.5:
+                                  status = "REVIEW"
+                              else:
+                                  status = "NO_HIGH_FLAG"
+
+                              rows.append({
+                                  "category": category,
+                                  "video": filename,
+                                  "timestamp_seconds": round(timestamp, 2),
+                                  "porn_score": round(porn, 4),
+                                  "hentai_score": round(hentai, 4),
+                                  "sexy_score": round(sexy, 4),
+                                  "status": status
+                              })
+
+                          except Exception as error:
+                              print(f"Frame error: {error}")
+
+          with output.open("w", newline="", encoding="utf-8-sig") as file:
+              columns = [
+                  "category", "video", "timestamp_seconds",
+                  "porn_score", "hentai_score", "sexy_score", "status"
+              ]
+              writer = csv.DictWriter(file, fieldnames=columns)
+              writer.writeheader()
+              writer.writerows(rows)
+
+          print(f"Finished. Analyzed {len(rows)} frames.")
+          print(f"Report: {output}")
+          PY
+
+          python test_moderation.py
+
+      - name: Upload moderation report
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: iplay-moderation-results
+          path: moderation_results.csv
+          if-no-files-found: warn
+          retention-days: 7
