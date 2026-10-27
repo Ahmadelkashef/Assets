@@ -1,0 +1,31 @@
+name: Upload Video Workflow
+
+on:
+  repository_dispatch:
+    types: [upload-reel]
+
+jobs:
+  upload:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+
+      - name: Save uploaded file
+        env:
+          FILE_DATA: ${{ github.event.client_payload.file_data }}
+          FILE_NAME: ${{ github.event.client_payload.file_name }}
+        run: |
+          mkdir -p Videos/Reels/Users
+          # تحويل بيانات الـ Base64 وحفظها في المجلد المحدد
+          echo "$FILE_DATA" | base64 --decode > "Videos/Reels/Users/$FILE_NAME"
+
+      - name: Commit and Push Video
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT_TOKEN }}
+        run: |
+          git config --global user.name "iPlay Bot"
+          git config --global user.email "bot@iplay.com"
+          git add Videos/Reels/Users/
+          git commit -m "Add new reel video via web upload: $FILE_NAME"
+          git push https://$GH_TOKEN@github.com/${{ github.repository }}.git HEAD:main
